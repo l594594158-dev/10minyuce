@@ -127,14 +127,21 @@ def check_signal(ind):
     
     return None, None
 
-# ═══════════ 历史秒级价格获取 ═══════════
-def get_price_at_second(target_ts):
-    """从缓存K线中取特定时间戳的收盘价"""
-    klines = load_klines()
-    for k in klines:
-        if k[0] == target_ts:
-            return k[4]
-    return None
+# ═══════════ 实时秒级价格获取 ═══════════
+def fetch_ticker_price():
+    """从币安获取实时BTCUSDT价格"""
+    try:
+        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        return float(resp.json()['price'])
+    except Exception as e:
+        notify(f"⚠️ 获取实时价失败: {e}")
+        return None
+
+def get_precise_time():
+    """返回精确到毫秒的时间戳"""
+    return int(time.time() * 1000)
 
 # ═══════════ 预测管理 ═══════════
 def load_predictions():
@@ -147,18 +154,27 @@ def save_predictions(preds):
     with open(PRED_FILE, 'w') as f:
         json.dump(preds, f, indent=2, ensure_ascii=False)
 
-def add_prediction(direction, price, ts, reason):
+def add_prediction(direction, reason, rt_price=None):
+    """用实时秒级价格记录预测"""
+    if rt_price is None:
+        rt_price = fetch_ticker_price()
+    if rt_price is None:
+        notify("⚠️ 无法获取实时价格，跳过信号")
+        return False
+    
+    now_ms = get_precise_time()
     preds = load_predictions()
     preds.append({
         'direction': direction,
-        'entry_price': price,
-        'entry_ts': ts,
-        'entry_time': datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
-        'verify_ts': ts + 600000,  # +10分钟
+        'entry_price': rt_price,
+        'entry_ts': now_ms,
+        'entry_time': datetime.fromtimestamp(now_ms/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+        'verify_ts': now_ms + 600000,  # +10分钟
         'reason': reason,
         'verified': False
     })
     save_predictions(preds)
+    return True
 
 # ═══════════ 验证 ═══════════
 def load_stats():
@@ -173,11 +189,10 @@ def save_stats(st):
         json.dump(st, f, indent=2, ensure_ascii=False)
 
 def verify_predictions():
-    """检查所有待验证预测"""
+    """用实时秒级价格验证所有过期预测"""
     preds = load_predictions()
     stats = load_stats()
-    klines = load_klines()
-    price_map = {k[0]: k[4] for k in klines}
+    now_ms = get_precise_time()
     
     verified_any = False
     new_preds = []
@@ -188,9 +203,14 @@ def verify_predictions():
             continue
         
         verify_ts = p['verify_ts']
-        # 找对应的收盘价（同一秒的K线）
-        if verify_ts in price_map:
-            exit_price = price_map[verify_ts]
+        
+        # 10分钟到了 → 用实时价格验证
+        if now_ms >= verify_ts:
+            exit_price = fetch_ticker_price()
+            if exit_price is None:
+                new_preds.append(p)
+                continue
+            
             entry_price = p['entry_price']
             predicted_up = (p['direction'] == 'LONG')
             actual_up = exit_price > entry_price
@@ -210,49 +230,33 @@ def verify_predictions():
                 stats['max_loss'] = max(stats['max_loss'], stats['current_streak_loss'])
             
             acc = stats['wins'] / stats['total'] * 100
-            
-            # 结果记录
-            result = {
-                'entry_time': p['entry_time'],
-                'direction': p['direction'],
-                'entry_price': entry_price,
-                'exit_price': exit_price,
-                'correct': correct,
-                'reason': p['reason']
-            }
-            stats['history'].append(result)
-            if len(stats['history']) > 500:
-                stats['history'] = stats['history'][-500:]
+            now_unix = now_ms / 1000
+            verify_time_str = datetime.fromtimestamp(now_unix, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             
             # 通知
             emoji = '✅' if correct else '❌'
             dir_cn = '📈做多' if p['direction'] == 'LONG' else '📉做空'
-            exit_time = datetime.fromtimestamp(verify_ts/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            change = exit_price - entry_price
+            arrow = '🔺' if change > 0 else '🔻' if change < 0 else '➡️'
             notify(f"{emoji} 验证: {dir_cn}")
-            notify(f"   入场: {p['entry_time']} | 价格 {entry_price}")
-            notify(f"   验证: {exit_time} | 价格 {exit_price}")
+            notify(f"   入场: {p['entry_time']} | 价格 {round(entry_price, 2)}")
+            notify(f"   验证: {verify_time_str} | 价格 {round(exit_price, 2)}")
+            notify(f"   变动: {change:+.2f} {arrow}")
             notify(f"   结果: {'正确' if correct else '错误'} | 胜率 {acc:.1f}% ({stats['wins']}/{stats['total']}) | 连中 {stats['current_streak_win']} 连挂 {stats['current_streak_loss']}")
             
             p['verified'] = True
             p['correct'] = correct
             p['exit_price'] = exit_price
+            p['verify_time'] = verify_time_str
             verified_any = True
         else:
-            # 还在等待中，检查是否超过12分钟还没数据（可能缺失）
-            now_ts = int(time.time() * 1000)
-            if now_ts > verify_ts + 720000:  # 超过12分钟
-                ongoing_klines = fetch_latest_klines(20)
-                if ongoing_klines:
-                    for k in ongoing_klines:
-                        price_map[k[0]] = k[4]
-                    with open(DATA_FILE, 'w') as f:
-                        json.dump(ongoing_klines, f)
-                    # 重新尝试验证
-                    if verify_ts in price_map:
-                        # 会下一轮验证
-                        pass
+            new_preds.append(p)
         
-        new_preds.append(p)
+        # 超过15分钟还未验证 → 标记过期
+        if not p['verified'] and now_ms > verify_ts + 900000:
+            p['verified'] = True
+            p['correct'] = None
+            p['exit_price'] = None
     
     save_predictions(new_preds)
     save_stats(stats)
@@ -278,19 +282,20 @@ def run():
     direction, reason = check_signal(ind)
     
     if direction:
-        price = ind['close']
-        ts = ind['ts']
-        time_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        rt_price = fetch_ticker_price()
+        now_ms = get_precise_time()
+        now_str = datetime.fromtimestamp(now_ms/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        expire_str = datetime.fromtimestamp((now_ms+600000)/1000, tz=timezone.utc).strftime('%H:%M:%S')
         dir_cn = '📈做多' if direction == 'LONG' else '📉做空'
         dir_pred = '涨📈' if direction == 'LONG' else '跌📉'
         
         notify(f"🔴 信号触发!")
-        notify(f"   {dir_cn} | 价格 {price} | 时间 {time_str}")
+        notify(f"   {dir_cn} | 实时价格 {rt_price} | 秒级时间 {now_str}")
         notify(f"   指标: {reason}")
-        notify(f"   预测: 10分钟后价格{dir_pred} | 到期 {datetime.fromtimestamp((ts+600000)/1000, tz=timezone.utc).strftime('%H:%M:%S')}")
+        notify(f"   预测: 10分钟后价格{dir_pred} | 到期 {expire_str}")
         
         # 记录预测
-        add_prediction(direction, price, ts, reason)
+        add_prediction(direction, reason, rt_price)
     
     # 4. 验证过期预测
     verified, stats = verify_predictions()
