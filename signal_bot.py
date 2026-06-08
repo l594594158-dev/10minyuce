@@ -1,75 +1,93 @@
 #!/usr/bin/env python3
 """
-⭐ 星子 — BTC 10分钟方向预测系统
+⭐ 星子 — BTC 10分钟方向预测系统 (秒级守护进程)
 策略: V2.0x+R5<22 (Z<-2.0 + RSI30<25 + 量>2xSMA + RSI5<22)
+每秒扫描1分钟K线是否收盘 → 信号触发 → 实时价格记录 → 10分钟后验证
 """
-import json, os, time, sys
+import json, os, time, sys, signal
 import requests
 import numpy as np
 from datetime import datetime, timezone
-from collections import deque
 
 # ═══════════ 配置 ═══════════
-DATA_FILE = "/root/.openclaw/signal_data.json"      # 历史K线缓存
-PRED_FILE = "/root/.openclaw/predictions.json"       # 待验证预测队列
-STATS_FILE = "/root/.openclaw/signal_stats.json"     # 统计
-LOG_FILE = "/root/.openclaw/signal_log.json"         # 完整日志
-KEEP_KLINES = 500  # 保留最近500根1mK线
+DATA_FILE   = "/root/.openclaw/signal_data.json"
+PRED_FILE   = "/root/.openclaw/predictions.json"
+STATS_FILE  = "/root/.openclaw/signal_stats.json"
+NOTIFY_FILE = "/root/.openclaw/signal_notify.json"
+KEEP_KLINES = 500
 
-# ═══════════ 公告通道 — 用message工具推送 ═══════════
+# ═══════════ 通知 ═══════════
 def notify(msg):
-    """控制台输出 + 文件记录（Telegram由外层调度）"""
+    """控制台输出 + 写入通知队列(由外层cron转发Telegram)"""
     ts = datetime.now().strftime('%m-%d %H:%M:%S')
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+    # 写入通知队列
+    try:
+        queue = []
+        if os.path.exists(NOTIFY_FILE):
+            with open(NOTIFY_FILE) as f:
+                queue = json.load(f)
+        queue.append({"ts": ts, "msg": msg})
+        with open(NOTIFY_FILE, 'w') as f:
+            json.dump(queue[-200:], f)  # 只保留最近200条
+    except:
+        pass
 
-# ═══════════ K线数据 ═══════════
-def load_klines():
+def drain_notifications():
+    """清空通知队列并返回待发送列表"""
+    if not os.path.exists(NOTIFY_FILE):
+        return []
+    with open(NOTIFY_FILE) as f:
+        queue = json.load(f)
+    # 清空文件
+    with open(NOTIFY_FILE, 'w') as f:
+        json.dump([], f)
+    return queue
+
+# ═══════════ 数据获取 ═══════════
+def api_get(url, timeout=5):
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        notify(f"⚠️ API失败: {e}")
+        return None
+
+def fetch_klines(limit=100):
+    """拉最近N根1m K线"""
+    data = api_get(f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit={limit}")
+    if not data: return None
+    return [[k[0], float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in data]
+
+def fetch_ticker():
+    """实时价格"""
+    data = api_get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
+    if data: return float(data['price'])
+    return None
+
+def ms_now():
+    return int(time.time() * 1000)
+
+def ts_to_str(ts_ms):
+    return datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+# ═══════════ K线缓存 ═══════════
+def load_cached_klines():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE) as f:
             return json.load(f)
     return []
 
-def fetch_latest_klines(limit=50):
-    """从币安拉最近N根1分钟K线"""
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit={limit}"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return [
-            [k[0], float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])]
-            for k in data
-        ]
-    except Exception as e:
-        notify(f"⚠️ 拉K线失败: {e}")
-        return None
-
-def update_klines():
-    """更新本地K线缓存"""
-    existing = load_klines()
-    new_data = fetch_latest_klines(100)
-    if not new_data:
-        return existing
-    
-    # 合并去重
-    seen = set(r[0] for r in existing)
-    for k in new_data:
-        if k[0] not in seen:
-            existing.append(k)
-            seen.add(k[0])
-    
-    existing.sort(key=lambda x: x[0])
-    if len(existing) > KEEP_KLINES:
-        existing = existing[-KEEP_KLINES:]
-    
+def save_klines(klines):
+    if len(klines) > KEEP_KLINES:
+        klines = klines[-KEEP_KLINES:]
     with open(DATA_FILE, 'w') as f:
-        json.dump(existing, f)
-    return existing
+        json.dump(klines, f)
 
 # ═══════════ 指标计算 ═══════════
 def calc_indicators(klines):
-    """用K线数据计算全部指标"""
     n = len(klines)
     if n < 31: return None
     
@@ -78,33 +96,23 @@ def calc_indicators(klines):
     l = np.array([k[3] for k in klines])
     v = np.array([k[5] for k in klines])
     
-    # ATR20
-    atr1 = h - l
-    atr20_val = atr1[-20:].mean()
+    atr20 = (h[-20:] - l[-20:]).mean()
+    if atr20 == 0: return None
     
-    if atr20_val == 0:
-        return None
-    
-    # Z-score
     ma20 = c[-20:].mean()
-    z = (c[-1] - ma20) / atr20_val
+    z = (c[-1] - ma20) / atr20
     
-    # RSI30
     d30 = np.diff(c[-31:])
     g30 = np.clip(d30, 0, None).mean()
     l30 = -np.clip(d30, None, 0).mean()
     rsi30 = 100 if l30 < 1e-10 else 100 - 100/(1 + g30/l30)
     
-    # RSI5
     d5 = np.diff(c[-6:])
     g5 = np.clip(d5, 0, None).mean()
     l5 = -np.clip(d5, None, 0).mean()
     rsi5 = 100 if l5 < 1e-10 else 100 - 100/(1 + g5/l5)
     
-    # 量比
-    v_now = v[-1]
-    v_sma20 = v[-20:].mean()
-    v_ratio = v_now / v_sma20 if v_sma20 > 0 else 0
+    v_ratio = v[-1] / v[-20:].mean() if v[-20:].mean() > 0 else 0
     
     return {
         'close': round(c[-1], 2),
@@ -115,33 +123,14 @@ def calc_indicators(klines):
         'ts': klines[-1][0]
     }
 
-# ═══════════ 信号检测 ═══════════
 def check_signal(ind):
-    if ind is None: return None, None
-    
-    if ind['v_ratio'] > 2.0:
-        if ind['z'] < -2.0 and ind['rsi30'] < 25 and ind['rsi5'] < 22:
-            return 'LONG', f"Z={ind['z']} RSI30={ind['rsi30']} RSI5={ind['rsi5']} 量比={ind['v_ratio']}x"
-        if ind['z'] > 2.0 and ind['rsi30'] > 75 and ind['rsi5'] > 78:
-            return 'SHORT', f"Z={ind['z']} RSI30={ind['rsi30']} RSI5={ind['rsi5']} 量比={ind['v_ratio']}x"
-    
+    if ind is None or ind['v_ratio'] <= 2.0:
+        return None, None
+    if ind['z'] < -2.0 and ind['rsi30'] < 25 and ind['rsi5'] < 22:
+        return 'LONG', f"Z={ind['z']} RSI30={ind['rsi30']} RSI5={ind['rsi5']} 量比={ind['v_ratio']}x"
+    if ind['z'] > 2.0 and ind['rsi30'] > 75 and ind['rsi5'] > 78:
+        return 'SHORT', f"Z={ind['z']} RSI30={ind['rsi30']} RSI5={ind['rsi5']} 量比={ind['v_ratio']}x"
     return None, None
-
-# ═══════════ 实时秒级价格获取 ═══════════
-def fetch_ticker_price():
-    """从币安获取实时BTCUSDT价格"""
-    try:
-        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        return float(resp.json()['price'])
-    except Exception as e:
-        notify(f"⚠️ 获取实时价失败: {e}")
-        return None
-
-def get_precise_time():
-    """返回精确到毫秒的时间戳"""
-    return int(time.time() * 1000)
 
 # ═══════════ 预测管理 ═══════════
 def load_predictions():
@@ -154,69 +143,57 @@ def save_predictions(preds):
     with open(PRED_FILE, 'w') as f:
         json.dump(preds, f, indent=2, ensure_ascii=False)
 
-def add_prediction(direction, reason, rt_price=None):
-    """用实时秒级价格记录预测"""
-    if rt_price is None:
-        rt_price = fetch_ticker_price()
-    if rt_price is None:
-        notify("⚠️ 无法获取实时价格，跳过信号")
-        return False
-    
-    now_ms = get_precise_time()
+def add_prediction(direction, reason, rt_price):
+    now_ms = ms_now()
     preds = load_predictions()
     preds.append({
         'direction': direction,
         'entry_price': rt_price,
         'entry_ts': now_ms,
-        'entry_time': datetime.fromtimestamp(now_ms/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
-        'verify_ts': now_ms + 600000,  # +10分钟
+        'entry_time': ts_to_str(now_ms),
+        'verify_ts': now_ms + 600000,
         'reason': reason,
         'verified': False
     })
     save_predictions(preds)
-    return True
+    return now_ms
 
-# ═══════════ 验证 ═══════════
+# ═══════════ 统计 ═══════════
 def load_stats():
     if os.path.exists(STATS_FILE):
         with open(STATS_FILE) as f:
             return json.load(f)
-    return {'total': 0, 'wins': 0, 'losses': 0, 'current_streak_win': 0, 'current_streak_loss': 0,
-            'max_win': 0, 'max_loss': 0, 'history': []}
+    return {'total': 0, 'wins': 0, 'losses': 0,
+            'current_streak_win': 0, 'current_streak_loss': 0,
+            'max_win': 0, 'max_loss': 0}
 
 def save_stats(st):
     with open(STATS_FILE, 'w') as f:
         json.dump(st, f, indent=2, ensure_ascii=False)
 
+# ═══════════ 验证 ═══════════
 def verify_predictions():
-    """用实时秒级价格验证所有过期预测"""
+    """用实时价格验证到期的预测"""
     preds = load_predictions()
     stats = load_stats()
-    now_ms = get_precise_time()
-    
+    now = ms_now()
     verified_any = False
-    new_preds = []
     
+    new_preds = []
     for p in preds:
         if p['verified']:
             new_preds.append(p)
             continue
         
-        verify_ts = p['verify_ts']
-        
-        # 10分钟到了 → 用实时价格验证
-        if now_ms >= verify_ts:
-            exit_price = fetch_ticker_price()
+        if now >= p['verify_ts']:
+            exit_price = fetch_ticker()
             if exit_price is None:
                 new_preds.append(p)
                 continue
             
             entry_price = p['entry_price']
-            predicted_up = (p['direction'] == 'LONG')
-            actual_up = exit_price > entry_price
-            correct = predicted_up == actual_up
+            correct = (exit_price > entry_price) == (p['direction'] == 'LONG')
             
-            # 更新统计
             stats['total'] += 1
             if correct:
                 stats['wins'] += 1
@@ -230,30 +207,31 @@ def verify_predictions():
                 stats['max_loss'] = max(stats['max_loss'], stats['current_streak_loss'])
             
             acc = stats['wins'] / stats['total'] * 100
-            now_unix = now_ms / 1000
-            verify_time_str = datetime.fromtimestamp(now_unix, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            
-            # 通知
-            emoji = '✅' if correct else '❌'
-            dir_cn = '📈做多' if p['direction'] == 'LONG' else '📉做空'
+            vtime = ts_to_str(ms_now())
             change = exit_price - entry_price
             arrow = '🔺' if change > 0 else '🔻' if change < 0 else '➡️'
+            emoji = '✅' if correct else '❌'
+            dir_cn = '📈做多' if p['direction'] == 'LONG' else '📉做空'
+            
             notify(f"{emoji} 验证: {dir_cn}")
-            notify(f"   入场: {p['entry_time']} | 价格 {round(entry_price, 2)}")
-            notify(f"   验证: {verify_time_str} | 价格 {round(exit_price, 2)}")
+            notify(f"   入场时间: {p['entry_time']}")
+            notify(f"   入场价格: {round(entry_price, 2)}")
+            notify(f"   验证时间: {vtime}")
+            notify(f"   验证价格: {round(exit_price, 2)}")
             notify(f"   变动: {change:+.2f} {arrow}")
-            notify(f"   结果: {'正确' if correct else '错误'} | 胜率 {acc:.1f}% ({stats['wins']}/{stats['total']}) | 连中 {stats['current_streak_win']} 连挂 {stats['current_streak_loss']}")
+            notify(f"   胜率: {acc:.1f}% ({stats['wins']}/{stats['total']}) | 连中{stats['current_streak_win']} 连挂{stats['current_streak_loss']}")
             
             p['verified'] = True
             p['correct'] = correct
             p['exit_price'] = exit_price
-            p['verify_time'] = verify_time_str
+            p['verify_time'] = vtime
             verified_any = True
         else:
             new_preds.append(p)
-        
-        # 超过15分钟还未验证 → 标记过期
-        if not p['verified'] and now_ms > verify_ts + 900000:
+    
+    # 清理超过15分钟未验证
+    for p in list(new_preds):
+        if not p['verified'] and now > p['verify_ts'] + 900000:
             p['verified'] = True
             p['correct'] = None
             p['exit_price'] = None
@@ -262,69 +240,92 @@ def verify_predictions():
     save_stats(stats)
     return verified_any, stats
 
-# ═══════════ 主流程 ═══════════
-def run():
-    notify("⭐ 星子启动 — V2.0x+R5<22 10分钟方向预测")
+# ═══════════ 守护进程主循环 ═══════════
+def run_daemon():
+    notify("⭐ 星子守护进程启动 — V2.0x+R5<22 每秒扫描")
     
-    # 1. 更新K线
-    klines = update_klines()
-    if not klines or len(klines) < 31:
-        notify("⚠️ K线数据不足")
-        return
+    # 加载初始数据
+    klines = load_cached_klines()
+    if not klines:
+        notify("📡 首次拉取K线...")
+        klines = fetch_klines(100) or []
+        if klines:
+            save_klines(klines)
     
-    # 2. 计算指标
-    ind = calc_indicators(klines)
-    if ind is None:
-        notify("⚠️ 指标计算失败")
-        return
+    if len(klines) < 31:
+        notify(f"⚠️ K线不足({len(klines)}根)，持续等待...")
     
-    # 3. 检查信号
-    direction, reason = check_signal(ind)
+    last_candle_ts = klines[-1][0] if klines else 0
+    tick = 0
     
-    if direction:
-        rt_price = fetch_ticker_price()
-        now_ms = get_precise_time()
-        now_str = datetime.fromtimestamp(now_ms/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        expire_str = datetime.fromtimestamp((now_ms+600000)/1000, tz=timezone.utc).strftime('%H:%M:%S')
-        dir_cn = '📈做多' if direction == 'LONG' else '📉做空'
-        dir_pred = '涨📈' if direction == 'LONG' else '跌📉'
+    while True:
+        try:
+            time.sleep(1)
+            tick += 1
+            now_ms = ms_now()
+            
+            # 每秒: 拉最新1根K线检查是否收盘
+            new_klines = fetch_klines(2)
+            if not new_klines:
+                continue
+            
+            latest = new_klines[-1]
+            latest_ts = latest[0]
+            
+            # 新蜡烛收盘!
+            if latest_ts != last_candle_ts:
+                last_candle_ts = latest_ts
+                
+                # 合并到本地缓存
+                seen = {k[0] for k in klines}
+                for k in new_klines:
+                    if k[0] not in seen:
+                        klines.append(k)
+                        seen.add(k[0])
+                klines.sort(key=lambda x: x[0])
+                if len(klines) > KEEP_KLINES:
+                    klines = klines[-KEEP_KLINES:]
+                save_klines(klines)
+                
+                # 计算指标 + 检查信号
+                ind = calc_indicators(klines)
+                if ind:
+                    direction, reason = check_signal(ind)
+                    if direction:
+                        rt_price = fetch_ticker()
+                        if rt_price:
+                            dir_cn = '📈做多' if direction == 'LONG' else '📉做空'
+                            dir_pred = '涨📈' if direction == 'LONG' else '跌📉'
+                            now_str = ts_to_str(ms_now())
+                            expire_str = ts_to_str(ms_now() + 600000)[-8:]
+                            
+                            notify(f"🔴 信号触发!")
+                            notify(f"   {dir_cn} | 实时价格 {rt_price}")
+                            notify(f"   入场时间: {now_str}")
+                            notify(f"   指标: {reason}")
+                            notify(f"   到期时间: {expire_str}")
+                            notify(f"   预测: 10分钟后价格{dir_pred}")
+                            
+                            add_prediction(direction, reason, rt_price)
+            
+            # 验证
+            verified, stats = verify_predictions()
+            
+            # 每5分钟输出心跳
+            if tick % 300 == 0 and stats['total'] > 0:
+                acc = stats['wins'] / stats['total'] * 100
+                pending = len([p for p in load_predictions() if not p['verified']])
+                notify(f"💓 心跳 | 总计{stats['total']}次 胜率{acc:.1f}% | 连中{stats['current_streak_win']} 连挂{stats['current_streak_loss']} | 待验证{pending}")
         
-        notify(f"🔴 信号触发!")
-        notify(f"   {dir_cn} | 实时价格 {rt_price} | 秒级时间 {now_str}")
-        notify(f"   指标: {reason}")
-        notify(f"   预测: 10分钟后价格{dir_pred} | 到期 {expire_str}")
-        
-        # 记录预测
-        add_prediction(direction, reason, rt_price)
-    
-    # 4. 验证过期预测
-    verified, stats = verify_predictions()
-    
-    # 5. 状态
-    if not direction and not verified:
-        # 无信号也无验证，偶尔输出心跳
-        pass
-    
-    # 清理过期未验证预测（超过15分钟）
-    preds = load_predictions()
-    now_ts = int(time.time() * 1000)
-    active = [p for p in preds if not p['verified'] and now_ts - p['verify_ts'] < 900000]
-    expired = len([p for p in preds if not p['verified']]) - len(active)
-    if expired > 0:
-        for p in preds:
-            if not p['verified'] and now_ts - p['verify_ts'] >= 900000:
-                p['verified'] = True
-                p['correct'] = None
-                p['exit_price'] = None
-        save_predictions(preds)
-        notify(f"⏰ {expired}条预测过期(>15分钟无数据)")
-    
-    return direction, stats
+        except KeyboardInterrupt:
+            notify("🛑 收到退出信号")
+            break
+        except Exception as e:
+            notify(f"💥 异常: {e}")
+            time.sleep(5)
 
 if __name__ == '__main__':
-    direction, stats = run()
-    
-    if stats and stats['total'] > 0:
-        acc = stats['wins'] / stats['total'] * 100
-        pending = len([p for p in load_predictions() if not p['verified']])
-        print(f"\n📊 总计: {stats['total']}次 | 胜率: {acc:.1f}% | 连中:{stats['current_streak_win']} 连挂:{stats['current_streak_loss']} | 待验证:{pending}")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    run_daemon()
+
+# ═══════════ PID防重复 ═══════════
