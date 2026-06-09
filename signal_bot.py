@@ -76,7 +76,9 @@ def load_preds():
     return json.load(open(PRED_FILE)) if os.path.exists(PRED_FILE) else []
 def save_preds(p): json.dump(p, open(PRED_FILE,'w'), indent=2, ensure_ascii=False)
 def load_stats():
-    return json.load(open(STATS_FILE)) if os.path.exists(STATS_FILE) else {'total':0,'wins':0,'losses':0,'current_streak_win':0,'current_streak_loss':0,'max_win':0,'max_loss':0}
+    if os.path.exists(STATS_FILE):
+        return json.load(open(STATS_FILE))
+    return {'total':0,'wins':0,'losses':0,'current_streak_win':0,'current_streak_loss':0,'max_win':0,'max_loss':0,'history':[]}
 def save_stats(s): json.dump(s, open(STATS_FILE,'w'), indent=2, ensure_ascii=False)
 
 def add_prediction(direction, reason, rt_price):
@@ -133,6 +135,11 @@ def verify_predictions():
                 stats['losses']+=1; stats['current_streak_loss']+=1; stats['current_streak_win']=0
                 stats['max_loss']=max(stats['max_loss'],stats['current_streak_loss'])
             p['verified']=True; p['correct']=correct; p['exit_price']=ep; p['verify_time']=ts_str(ms_now())
+            stats.setdefault('history',[]).append({
+                'direction':p['direction'],'entry_price':p['entry_price'],
+                'entry_time':p['entry_time'],'exit_price':ep,
+                'verify_time':p['verify_time'],'correct':correct
+            })
             notify_verify(p,ep,stats)
         else: new.append(p)
     exp=0
