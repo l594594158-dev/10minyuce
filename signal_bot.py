@@ -199,4 +199,15 @@ def run():
 
 if __name__=='__main__':
     sig.signal(sig.SIGTERM, lambda *_: sys.exit(0))
-    run()
+    restart_count = 0
+    while True:
+        try:
+            run()
+        except SystemExit:
+            break
+        except Exception as e:
+            restart_count += 1
+            notify(f'🔄 守护进程崩溃 #{restart_count}: {e}')
+            time.sleep(5)
+            # 标记重启后继续
+            continue
