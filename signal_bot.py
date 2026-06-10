@@ -12,16 +12,23 @@ NOTIFY_FILE = "/root/.openclaw/signal_notify.json"
 KEEP_KLINES = 500
 HB_INTERVAL = 3600  # 每小时心跳
 
+def send_telegram_direct(msg):
+    """直接调用Telegram API发消息,绕开cron和LLM"""
+    import urllib.request, urllib.parse
+    try:
+        token = json.load(open("/root/.openclaw/openclaw.json"))["channels"]["telegram"]["botToken"]
+        data = urllib.parse.urlencode({"chat_id": "6155212881", "text": msg}).encode()
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data, method="POST")
+        urllib.request.urlopen(req, timeout=10).read()
+    except: pass
+
 def notify(msg, queue=True):
     ts = datetime.now().strftime('%m-%d %H:%M:%S')
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     if not queue: return
-    try:
-        q = json.load(open(NOTIFY_FILE)) if os.path.exists(NOTIFY_FILE) else []
-        q.append(line)
-        json.dump(q, open(NOTIFY_FILE,'w'), ensure_ascii=False)
-    except: pass
+    # 直接发Telegram
+    send_telegram_direct(msg)
 
 def api_get(url, timeout=5):
     try:
