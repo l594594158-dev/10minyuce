@@ -12,14 +12,15 @@ NOTIFY_FILE = "/root/.openclaw/signal_notify.json"
 KEEP_KLINES = 500
 HB_INTERVAL = 3600  # 每小时心跳
 
-def notify(msg):
+def notify(msg, queue=True):
     ts = datetime.now().strftime('%m-%d %H:%M:%S')
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+    if not queue: return
     try:
-        queue = json.load(open(NOTIFY_FILE)) if os.path.exists(NOTIFY_FILE) else []
-        queue.append(line)
-        json.dump(queue, open(NOTIFY_FILE,'w'), ensure_ascii=False)
+        q = json.load(open(NOTIFY_FILE)) if os.path.exists(NOTIFY_FILE) else []
+        q.append(line)
+        json.dump(q, open(NOTIFY_FILE,'w'), ensure_ascii=False)
     except: pass
 
 def api_get(url, timeout=5):
@@ -27,7 +28,7 @@ def api_get(url, timeout=5):
         r = requests.get(url, timeout=timeout); r.raise_for_status()
         return r.json()
     except Exception as e:
-        notify(f"⚠️ API: {e}"); return None
+        notify(f"⚠️ API: {e}", queue=False); return None
 
 def fetch_klines(limit=100):
     d = api_get(f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit={limit}")
@@ -146,17 +147,17 @@ def verify_predictions():
     for p in list(new):
         if not p['verified'] and now>p['verify_ts']+900000:
             p['verified']=True; p['correct']=None; p['exit_price']=None; exp+=1
-    if exp: notify(f"⏰ {exp}条预测过期")
+    if exp: notify(f"⏰ {exp}条预测过期", queue=False)
     save_preds(new); save_stats(stats)
 
 # 主循环
 def run():
-    notify("⭐ 星子 v2 启动 — V2.0x+R5<22 每秒扫描")
+    notify("⭐ 星子 v2 启动 — V2.0x+R5<22 每秒扫描", queue=False)
     kk=load_klines()
     if not kk:
-        notify("📡 拉取K线..."); kk=fetch_klines(100) or []
+        notify("📡 拉取K线...", queue=False); kk=fetch_klines(100) or []
         if kk: save_klines(kk)
-    if len(kk)<31: notify(f"⚠️ K线不足({len(kk)}根)")
+    if len(kk)<31: notify(f"⚠️ K线不足({len(kk)}根)", queue=False)
     
     last_ts=kk[-1][0] if kk else 0; tick=0
     
@@ -191,14 +192,14 @@ def run():
             if tick%HB_INTERVAL==0:
                 s=load_stats()
                 if s['total']>0:
-                    notify(f"💓 心跳 | {s['total']}次 胜率{s['wins']/s['total']*100:.1f}% | 连中{s['current_streak_win']}连挂{s['current_streak_loss']}")
+                    notify(f"💓 心跳 | {s['total']}次 胜率{s['wins']/s['total']*100:.1f}% | 连中{s['current_streak_win']}连挂{s['current_streak_loss']}", queue=False)
                 # 无信号时不发心跳
             
         except KeyboardInterrupt:
-            notify("🛑 退出"); break
+            notify("🛑 退出", queue=False); break
         except Exception as e:
             traceback.print_exc()
-            notify(f"💥 异常: {e}")
+            notify(f"💥 异常: {e}", queue=False)
             time.sleep(5)
 
 if __name__=='__main__':
@@ -211,7 +212,7 @@ if __name__=='__main__':
             break
         except Exception as e:
             restart_count += 1
-            notify(f'🔄 守护进程崩溃 #{restart_count}: {e}')
+            notify(f'🔄 守护进程崩溃 #{restart_count}: {e}', queue=False)
             time.sleep(5)
             # 标记重启后继续
             continue
