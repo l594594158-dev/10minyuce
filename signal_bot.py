@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """⭐ 星子 v2 — BTC 10分钟方向预测 守护进程"""
-import json, os, time, sys, signal as sig
+import json, os, time, sys, signal as sig, traceback
 import requests
 import numpy as np
 from datetime import datetime, timezone
@@ -162,7 +162,7 @@ def run():
     
     while True:
         try:
-            time.sleep(1); tick+=1
+            time.sleep(3); tick+=1
             
             nk=fetch_klines(2)
             if not nk: continue
@@ -194,8 +194,12 @@ def run():
                     notify(f"💓 心跳 | {s['total']}次 胜率{s['wins']/s['total']*100:.1f}% | 连中{s['current_streak_win']}连挂{s['current_streak_loss']}")
                 # 无信号时不发心跳
             
-        except KeyboardInterrupt: notify("🛑 退出"); break
-        except Exception as e: notify(f"💥 {e}"); time.sleep(5)
+        except KeyboardInterrupt:
+            notify("🛑 退出"); break
+        except Exception as e:
+            traceback.print_exc()
+            notify(f"💥 异常: {e}")
+            time.sleep(5)
 
 if __name__=='__main__':
     sig.signal(sig.SIGTERM, lambda *_: sys.exit(0))
